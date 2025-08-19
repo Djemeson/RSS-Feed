@@ -19,9 +19,13 @@ import re
 import time
 import hashlib
 import sqlite3
+import json
+from datetime import datetime
 from typing import Optional
+from urllib.parse import urljoin
 
 import feedparser
+from urllib.request import Request, urlopen
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -127,6 +131,16 @@ def sha1(s: str) -> str:
 
 
 IMG_RE = re.compile(r"<img[^>]+src=['\"]([^'\"]+)['\"]", re.I)
+FEED_LINK_RE = re.compile(
+    r'<link[^>]+type=["\']application/(?:rss|atom)\+xml["\'][^>]*>|'
+    r'<link[^>]+type=["\']application/(?:json|feed\+json)["\'][^>]*>',
+    re.I,
+)
+HREF_RE = re.compile(r"href=['\"]([^'\"]+)['\"]", re.I)
+TITLE_RE = re.compile(r"<title>(.*?)</title>", re.I | re.S)
+ARTICLE_RE = re.compile(r"<article[^>]*>(.*?)</article>", re.I | re.S)
+LINK_IN_ARTICLE_RE = re.compile(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', re.I | re.S)
+H2_LINK_RE = re.compile(r'<h[1-6][^>]*><a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', re.I | re.S)
 
 
 def extract_image(entry, content_html: str) -> Optional[str]:
@@ -152,6 +166,17 @@ def to_ts(struct_time) -> int:
         return int(time.time())
     try:
         return int(time.mktime(struct_time))
+    except Exception:
+        return int(time.time())
+
+
+def parse_iso_ts(s: Optional[str]) -> int:
+    if not s:
+        return int(time.time())
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return int(datetime.fromisoformat(s).timestamp())
     except Exception:
         return int(time.time())
 
@@ -198,41 +223,175 @@ def insert_item(conn, data: dict):
     )
 
 
+def parse_feed_url(feed_url: str):
+    parsed = feedparser.parse(feed_url)
+    if parsed.feed and parsed.entries:
+        ftype = "atom" if "atom" in (parsed.version or "").lower() else "rss"
+        title = parsed.feed.get("title", feed_url)
+        return {"url": feed_url, "title": title, "type": ftype, "parsed": parsed}
+    try:
+        req = Request(feed_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=10) as resp:
+            data = resp.read()
+        js = json.loads(data)
+        if isinstance(js, dict) and js.get("items"):
+            title = js.get("title", feed_url)
+            return {"url": feed_url, "title": title, "type": "json", "parsed": js}
+    except Exception:
+        pass
+    return None
+
+
+def scrape_html_page(url: str):
+    try:
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=10) as resp:
+            html = resp.read().decode("utf-8", "ignore")
+            base_url = resp.geturl()
+    except Exception:
+        raise ValueError("Feed não encontrado")
+    title_match = TITLE_RE.search(html)
+    page_title = bleach.clean(title_match.group(1), strip=True) if title_match else url
+    items = []
+    for block in ARTICLE_RE.findall(html):
+        m = LINK_IN_ARTICLE_RE.search(block)
+        if not m:
+            continue
+        href, t = m.group(1), m.group(2)
+        link = urljoin(base_url, href)
+        title = bleach.clean(t, strip=True)
+        summary = (bleach.clean(block, strip=True) or "")[:500]
+        img_match = IMG_RE.search(block)
+        image = urljoin(base_url, img_match.group(1)) if img_match else None
+        items.append({"title": title, "link": link, "summary": summary, "content": sanitize_html(block), "image": image})
+    if not items:
+        for href, t in H2_LINK_RE.findall(html):
+            link = urljoin(base_url, href)
+            title = bleach.clean(t, strip=True)
+            items.append({"title": title, "link": link, "summary": "", "content": "", "image": None})
+    if not items:
+        raise ValueError("Feed não encontrado")
+    return page_title, items
+
+
+def discover_feeds(url: str):
+    candidate = parse_feed_url(url)
+    if candidate:
+        return [candidate]
+    try:
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=10) as resp:
+            html = resp.read().decode("utf-8", "ignore")
+            base_url = resp.geturl()
+    except Exception:
+        raise ValueError("Feed não encontrado")
+    feeds = []
+    for tag in FEED_LINK_RE.findall(html):
+        href_match = HREF_RE.search(tag)
+        if not href_match:
+            continue
+        feed_url = urljoin(base_url, href_match.group(1))
+        parsed = parse_feed_url(feed_url)
+        if parsed:
+            feeds.append(parsed)
+    if feeds:
+        return feeds
+    title_match = TITLE_RE.search(html)
+    page_title = bleach.clean(title_match.group(1), strip=True) if title_match else base_url
+    return [{"url": base_url, "title": page_title, "type": "html", "parsed": html}]
+
+
+def discover_feed_url(url: str):
+    feeds = discover_feeds(url)
+    f = feeds[0]
+    return f["url"], f.get("parsed"), f["type"]
+
+
 def fetch_feed(url: str):
+    feed_url, parsed, ftype = discover_feed_url(url)
     conn = get_db()
     try:
-        parsed = feedparser.parse(url)
-        title = parsed.feed.get("title", url)
-        site_url = parsed.feed.get("link")
-        upsert_feed(conn, url, title, site_url)
-        feed_row = get_feed_by_url(conn, url)
-        for e in parsed.entries:
-            guid = e.get("id") or e.get("guid") or e.get("link") or (e.get("title", "") + str(e.get("published", "")))
-            item_id = sha1(guid)
-            # content
-            content_html = ""
-            if e.get("content") and isinstance(e.get("content"), list):
-                content_html = e["content"][0].get("value", "")
-            else:
-                content_html = e.get("summary", "")
-            content_clean = sanitize_html(content_html)
-            summary = (bleach.clean(e.get("summary", ""), strip=True) or "")[:500]
-            ts = to_ts(e.get("published_parsed") or e.get("updated_parsed"))
-            image = extract_image(e, content_html)
-            insert_item(
-                conn,
-                {
-                    "id": item_id,
-                    "feed_id": feed_row["id"],
-                    "title": e.get("title") or "(sem título)",
-                    "link": e.get("link", "#"),
-                    "author": e.get("author", ""),
-                    "pub_date": ts,
-                    "content": content_clean,
-                    "summary": summary,
-                    "image": image,
-                },
-            )
+        if ftype == "json":
+            title = parsed.get("title", feed_url)
+            site_url = parsed.get("home_page_url") or url
+            upsert_feed(conn, feed_url, title, site_url)
+            feed_row = get_feed_by_url(conn, feed_url)
+            for e in parsed.get("items", []):
+                guid = e.get("id") or e.get("url") or (e.get("title", "") + (e.get("date_published", "") or ""))
+                item_id = sha1(guid)
+                content_html = e.get("content_html") or e.get("content_text") or ""
+                content_clean = sanitize_html(content_html)
+                summary = (bleach.clean(e.get("summary") or e.get("content_text") or "", strip=True) or "")[:500]
+                ts = parse_iso_ts(e.get("date_published") or e.get("date_modified"))
+                author = e.get("author", "")
+                if isinstance(author, dict):
+                    author = author.get("name", "")
+                image = e.get("image")
+                insert_item(
+                    conn,
+                    {
+                        "id": item_id,
+                        "feed_id": feed_row["id"],
+                        "title": e.get("title") or "(sem título)",
+                        "link": e.get("url", "#"),
+                        "author": author,
+                        "pub_date": ts,
+                        "content": content_clean,
+                        "summary": summary,
+                        "image": image,
+                    },
+                )
+        elif ftype == "html":
+            page_title, items = scrape_html_page(feed_url)
+            upsert_feed(conn, feed_url, page_title, feed_url)
+            feed_row = get_feed_by_url(conn, feed_url)
+            for it in items:
+                item_id = sha1(it["link"])
+                insert_item(
+                    conn,
+                    {
+                        "id": item_id,
+                        "feed_id": feed_row["id"],
+                        "title": it["title"] or "(sem título)",
+                        "link": it["link"],
+                        "author": "",
+                        "pub_date": int(time.time()),
+                        "content": it.get("content", ""),
+                        "summary": it.get("summary", ""),
+                        "image": it.get("image"),
+                    },
+                )
+        else:
+            title = parsed.feed.get("title", feed_url)
+            site_url = parsed.feed.get("link") or url
+            upsert_feed(conn, feed_url, title, site_url)
+            feed_row = get_feed_by_url(conn, feed_url)
+            for e in parsed.entries:
+                guid = e.get("id") or e.get("guid") or e.get("link") or (e.get("title", "") + str(e.get("published", "")))
+                item_id = sha1(guid)
+                content_html = ""
+                if e.get("content") and isinstance(e.get("content"), list):
+                    content_html = e["content"][0].get("value", "")
+                else:
+                    content_html = e.get("summary", "")
+                content_clean = sanitize_html(content_html)
+                summary = (bleach.clean(e.get("summary", ""), strip=True) or "")[:500]
+                ts = to_ts(e.get("published_parsed") or e.get("updated_parsed"))
+                image = extract_image(e, content_html)
+                insert_item(
+                    conn,
+                    {
+                        "id": item_id,
+                        "feed_id": feed_row["id"],
+                        "title": e.get("title") or "(sem título)",
+                        "link": e.get("link", "#"),
+                        "author": e.get("author", ""),
+                        "pub_date": ts,
+                        "content": content_clean,
+                        "summary": summary,
+                        "image": image,
+                    },
+                )
         conn.commit()
     finally:
         conn.close()
@@ -297,6 +456,15 @@ async def api_feeds():
         conn.close()
 
 
+@app.get("/api/discover")
+async def api_discover(url: str):
+    try:
+        feeds = discover_feeds(url)
+        return JSONResponse([{ "url": f["url"], "title": f["title"], "type": f["type"] } for f in feeds])
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
 @app.post("/api/feeds")
 async def api_add_feed(payload: dict):
     url = (payload or {}).get("url")
@@ -305,6 +473,8 @@ async def api_add_feed(payload: dict):
     try:
         fetch_feed(url)
         return JSONResponse({"ok": True})
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -494,6 +664,17 @@ HTML = """<!doctype html>
     </main>
   </div>
 
+  <div id=\"addFeedModal\" class=\"fixed inset-0 bg-black/50 hidden items-center justify-center\">
+    <div class=\"bg-white dark:bg-gray-900 rounded-xl p-4 w-full max-w-md\">
+      <h3 class=\"font-semibold mb-2\">Adicionar Feed</h3>
+      <input id=\"addFeedInput\" placeholder=\"URL da página\" class=\"w-full rounded-xl border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-800 px-3 py-2 mb-2\" />
+      <div id=\"feedOptions\" class=\"max-h-60 overflow-auto space-y-1 text-sm\"></div>
+      <div class=\"text-right mt-3\">
+        <button id=\"closeAddFeed\" class=\"px-3 py-1 rounded-xl border border-gray-300 dark:border-gray-700\">Fechar</button>
+      </div>
+    </div>
+  </div>
+
   <script>
     const themeBtn = document.getElementById('themeBtn');
     const userPref = localStorage.getItem('theme') || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
@@ -608,11 +789,30 @@ HTML = """<!doctype html>
       state.items=state.items.concat(arr); state.offset+=state.limit; renderItems(true);
     }
 
-    document.getElementById('addFeedBtn').onclick=async()=>{
-      const url=prompt('Informe a URL do feed RSS:'); if(!url) return;
-      const resp=await fetch('/api/feeds',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
-      if(resp.ok){ await loadFeeds(); await loadItems(true); } else { alert('Erro ao adicionar feed'); }
-    };
+    const addFeedModal=document.getElementById('addFeedModal');
+    const addFeedInput=document.getElementById('addFeedInput');
+    const feedOptions=document.getElementById('feedOptions');
+    const closeAddFeed=document.getElementById('closeAddFeed');
+    document.getElementById('addFeedBtn').onclick=()=>{ addFeedModal.classList.remove('hidden'); addFeedModal.classList.add('flex'); addFeedInput.value=''; feedOptions.innerHTML=''; addFeedInput.focus(); };
+    closeAddFeed.onclick=()=>{ addFeedModal.classList.add('hidden'); addFeedModal.classList.remove('flex'); };
+    async function discoverFeeds(url){
+      feedOptions.innerHTML='<div class="text-gray-500 text-sm">Buscando...</div>';
+      try{
+        const resp=await fetch('/api/discover?url='+encodeURIComponent(url));
+        if(!resp.ok){ feedOptions.innerHTML='<div class="text-sm text-red-500">Nenhum feed encontrado</div>'; return; }
+        const feeds=await resp.json();
+        if(!feeds.length){ feedOptions.innerHTML='<div class="text-sm text-red-500">Nenhum feed encontrado</div>'; return; }
+        feedOptions.innerHTML='';
+        feeds.forEach(f=>{
+          const b=document.createElement('button');
+          b.className='w-full text-left px-3 py-2 rounded-xl hover:bg-gray-100 dark:hover:bg-gray-800';
+          b.innerHTML=`<div class="font-medium">${f.title}</div><div class="text-xs text-gray-500">${f.type.toUpperCase()} • ${f.url}</div>`;
+          b.onclick=async()=>{ const resp=await fetch('/api/feeds',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:f.url})}); if(resp.ok){ closeAddFeed.onclick(); await loadFeeds(); await loadItems(true); } else { alert('Erro ao adicionar feed'); } };
+          feedOptions.appendChild(b);
+        });
+      }catch(e){ feedOptions.innerHTML='<div class="text-sm text-red-500">Erro</div>'; }
+    }
+    addFeedInput.addEventListener('input',e=>{ const url=e.target.value.trim(); if(url) discoverFeeds(url); else feedOptions.innerHTML=''; });
     document.getElementById('refreshBtn').onclick=async()=>{
       document.getElementById('refreshBtn').classList.add('animate-pulse');
       await fetch('/api/refresh',{method:'POST'});
