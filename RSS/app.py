@@ -309,6 +309,18 @@ async def api_add_feed(payload: dict):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+@app.delete("/api/feeds/{feed_id}")
+async def api_delete_feed(feed_id: int):
+    conn = get_db()
+    try:
+        conn.execute("DELETE FROM items WHERE feed_id=?", (feed_id,))
+        conn.execute("DELETE FROM feeds WHERE id=?", (feed_id,))
+        conn.commit()
+        return JSONResponse({"ok": True})
+    finally:
+        conn.close()
+
+
 @app.post("/api/refresh")
 async def api_refresh():
     # dispara atualização em background (rápido)
@@ -520,13 +532,36 @@ HTML = """<!doctype html>
       feedList.appendChild(allBtn);
 
       state.feeds.forEach(f=>{
-        const b=document.createElement('button');
-        b.className='w-full flex items-center justify-between rounded-xl px-3 py-2 hover:bg-gray-100 dark:hover:bg-gray-800';
-        b.dataset.id=f.id;
-        b.innerHTML=`<span class="flex items-center gap-2">${icon('rss')} <span class="truncate max-w-[140px]" title="${f.title||f.url}">${f.title||f.url}</span></span>`+
-                     `<span class="text-xs rounded-full bg-gray-100 dark:bg-gray-800 px-2 py-0.5">${f.unread_count}</span>`;
-        b.onclick=()=>{ state.selectedFeed=f.id; state.offset=0; loadItems(true); highlightSelectedFeed(f.id); };
-        feedList.appendChild(b);
+        const row=document.createElement('div');
+        row.className='w-full flex items-center justify-between rounded-xl px-3 py-2 hover:bg-gray-100 dark:hover:bg-gray-800';
+        row.dataset.id=f.id;
+
+        const left=document.createElement('span');
+        left.className='flex items-center gap-2';
+        left.innerHTML=`${icon('rss')} <span class="truncate max-w-[140px]" title="${f.title||f.url}">${f.title||f.url}</span>`;
+
+        const right=document.createElement('div');
+        right.className='flex items-center gap-2';
+        right.innerHTML=`<span class="text-xs rounded-full bg-gray-100 dark:bg-gray-800 px-2 py-0.5">${f.unread_count}</span>`;
+
+        const del=document.createElement('button');
+        del.className='text-red-500 hover:text-red-700';
+        del.innerHTML=icon('trash');
+        del.onclick=async(ev)=>{
+          ev.stopPropagation();
+          if(confirm('Excluir este feed?')){
+            await fetch('/api/feeds/'+f.id,{method:'DELETE'});
+            if(state.selectedFeed===f.id) state.selectedFeed=null;
+            await loadFeeds();
+            await loadItems(true);
+          }
+        };
+        right.appendChild(del);
+
+        row.appendChild(left);
+        row.appendChild(right);
+        row.onclick=()=>{ state.selectedFeed=f.id; state.offset=0; loadItems(true); highlightSelectedFeed(f.id); };
+        feedList.appendChild(row);
       });
       lucide.createIcons();
       highlightSelectedFeed(state.selectedFeed);
