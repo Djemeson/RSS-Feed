@@ -20,8 +20,10 @@ import time
 import hashlib
 import sqlite3
 from typing import Optional
+from urllib.parse import urljoin
 
 import feedparser
+from urllib.request import Request, urlopen
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -127,6 +129,10 @@ def sha1(s: str) -> str:
 
 
 IMG_RE = re.compile(r"<img[^>]+src=['\"]([^'\"]+)['\"]", re.I)
+FEED_LINK_RE = re.compile(
+    r"<link[^>]+type=['\"]application/(?:rss|atom)\+xml['\"][^>]*>", re.I
+)
+HREF_RE = re.compile(r"href=['\"]([^'\"]+)['\"]", re.I)
 
 
 def extract_image(entry, content_html: str) -> Optional[str]:
@@ -198,14 +204,36 @@ def insert_item(conn, data: dict):
     )
 
 
+def discover_feed_url(url: str):
+    parsed = feedparser.parse(url)
+    if parsed.feed and parsed.entries:
+        return url, parsed
+    try:
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=10) as resp:
+            html = resp.read().decode("utf-8", "ignore")
+            base_url = resp.geturl()
+        for tag in FEED_LINK_RE.findall(html):
+            href_match = HREF_RE.search(tag)
+            if not href_match:
+                continue
+            feed_url = urljoin(base_url, href_match.group(1))
+            parsed = feedparser.parse(feed_url)
+            if parsed.feed and parsed.entries:
+                return feed_url, parsed
+    except Exception:
+        pass
+    raise ValueError("Feed não encontrado")
+
+
 def fetch_feed(url: str):
+    feed_url, parsed = discover_feed_url(url)
     conn = get_db()
     try:
-        parsed = feedparser.parse(url)
-        title = parsed.feed.get("title", url)
-        site_url = parsed.feed.get("link")
-        upsert_feed(conn, url, title, site_url)
-        feed_row = get_feed_by_url(conn, url)
+        title = parsed.feed.get("title", feed_url)
+        site_url = parsed.feed.get("link") or url
+        upsert_feed(conn, feed_url, title, site_url)
+        feed_row = get_feed_by_url(conn, feed_url)
         for e in parsed.entries:
             guid = e.get("id") or e.get("guid") or e.get("link") or (e.get("title", "") + str(e.get("published", "")))
             item_id = sha1(guid)
@@ -305,6 +333,8 @@ async def api_add_feed(payload: dict):
     try:
         fetch_feed(url)
         return JSONResponse({"ok": True})
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
