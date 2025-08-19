@@ -307,8 +307,11 @@ def discover_feed_url(url: str):
     return f["url"], f.get("parsed"), f["type"]
 
 
-def fetch_feed(url: str):
-    feed_url, parsed, ftype = discover_feed_url(url)
+def fetch_feed(url: str, force_html: bool = False):
+    if force_html:
+        feed_url, parsed, ftype = url, None, "html"
+    else:
+        feed_url, parsed, ftype = discover_feed_url(url)
     conn = get_db()
     try:
         if ftype == "json":
@@ -468,10 +471,11 @@ async def api_discover(url: str):
 @app.post("/api/feeds")
 async def api_add_feed(payload: dict):
     url = (payload or {}).get("url")
+    force = bool((payload or {}).get("force"))
     if not url:
         return JSONResponse({"error": "Informe url"}, status_code=400)
     try:
-        fetch_feed(url)
+        fetch_feed(url, force_html=force)
         return JSONResponse({"ok": True})
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
@@ -799,18 +803,41 @@ HTML = """<!doctype html>
       feedOptions.innerHTML='<div class="text-gray-500 text-sm">Buscando...</div>';
       try{
         const resp=await fetch('/api/discover?url='+encodeURIComponent(url));
-        if(!resp.ok){ feedOptions.innerHTML='<div class="text-sm text-red-500">Nenhum feed encontrado</div>'; return; }
+        if(!resp.ok){
+          feedOptions.innerHTML='<div class="text-sm text-red-500">Nenhum feed encontrado</div>';
+          const b=document.createElement('button');
+          b.className='mt-2 w-full text-left px-3 py-2 rounded-xl hover:bg-gray-100 dark:hover:bg-gray-800';
+          b.textContent='Adicionar mesmo assim';
+          b.onclick=async()=>{ const r=await fetch('/api/feeds',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:url,force:true})}); if(r.ok){ closeAddFeed.onclick(); await loadFeeds(); await loadItems(true); } else { alert("Erro ao adicionar feed"); } };
+          feedOptions.appendChild(b);
+          return;
+        }
         const feeds=await resp.json();
-        if(!feeds.length){ feedOptions.innerHTML='<div class="text-sm text-red-500">Nenhum feed encontrado</div>'; return; }
+        if(!feeds.length){
+          feedOptions.innerHTML='<div class="text-sm text-red-500">Nenhum feed encontrado</div>';
+          const b=document.createElement('button');
+          b.className='mt-2 w-full text-left px-3 py-2 rounded-xl hover:bg-gray-100 dark:hover:bg-gray-800';
+          b.textContent='Adicionar mesmo assim';
+          b.onclick=async()=>{ const r=await fetch('/api/feeds',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:url,force:true})}); if(r.ok){ closeAddFeed.onclick(); await loadFeeds(); await loadItems(true); } else { alert("Erro ao adicionar feed"); } };
+          feedOptions.appendChild(b);
+          return;
+        }
         feedOptions.innerHTML='';
         feeds.forEach(f=>{
           const b=document.createElement('button');
           b.className='w-full text-left px-3 py-2 rounded-xl hover:bg-gray-100 dark:hover:bg-gray-800';
           b.innerHTML=`<div class="font-medium">${f.title}</div><div class="text-xs text-gray-500">${f.type.toUpperCase()} • ${f.url}</div>`;
-          b.onclick=async()=>{ const resp=await fetch('/api/feeds',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:f.url})}); if(resp.ok){ closeAddFeed.onclick(); await loadFeeds(); await loadItems(true); } else { alert('Erro ao adicionar feed'); } };
+          b.onclick=async()=>{ const r=await fetch('/api/feeds',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:f.url})}); if(r.ok){ closeAddFeed.onclick(); await loadFeeds(); await loadItems(true); } else { alert('Erro ao adicionar feed'); } };
           feedOptions.appendChild(b);
         });
-      }catch(e){ feedOptions.innerHTML='<div class="text-sm text-red-500">Erro</div>'; }
+      }catch(e){
+        feedOptions.innerHTML='<div class="text-sm text-red-500">Erro</div>';
+        const b=document.createElement('button');
+        b.className='mt-2 w-full text-left px-3 py-2 rounded-xl hover:bg-gray-100 dark:hover:bg-gray-800';
+        b.textContent='Adicionar mesmo assim';
+        b.onclick=async()=>{ const r=await fetch('/api/feeds',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:url,force:true})}); if(r.ok){ closeAddFeed.onclick(); await loadFeeds(); await loadItems(true); } else { alert("Erro ao adicionar feed"); } };
+        feedOptions.appendChild(b);
+      }
     }
     addFeedInput.addEventListener('input',e=>{ const url=e.target.value.trim(); if(url) discoverFeeds(url); else feedOptions.innerHTML=''; });
     document.getElementById('refreshBtn').onclick=async()=>{
