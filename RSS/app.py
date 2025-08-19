@@ -32,6 +32,24 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import bleach
 
+# NEW: libs para extração de artigo completo (com fallback elegante)
+try:
+    from readability import Document  # readability-lxml
+    HAVE_READABILITY = True
+except Exception:
+    Document = None
+    HAVE_READABILITY = False
+
+try:
+    from bs4 import BeautifulSoup  # beautifulsoup4
+    HAVE_BS4 = True
+except Exception:
+    BeautifulSoup = None
+    HAVE_BS4 = False
+
+# NEW: flag para ligar/desligar full-text
+FETCH_FULLTEXT = int(os.getenv("FETCH_FULLTEXT", 1))
+
 PORT = int(os.getenv("PORT", 8000))
 REFRESH_MINUTES = int(os.getenv("REFRESH_MINUTES", 15))
 DEFAULT_FEEDS = [u for u in (os.getenv("SEED_FEEDS", """
@@ -112,7 +130,21 @@ def init_db():
 # ------------------------------
 
 ALLOWED_TAGS = bleach.sanitizer.ALLOWED_TAGS.union(
-    {"img", "figure", "figcaption"}
+    {
+        "img",
+        "figure",
+        "figcaption",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "pre",
+        "code",
+        "blockquote",
+        "hr",
+    }
 )
 ALLOWED_ATTRS = {
     **bleach.sanitizer.ALLOWED_ATTRIBUTES,
@@ -148,6 +180,89 @@ TITLE_RE = re.compile(r"<title>(.*?)</title>", re.I | re.S)
 ARTICLE_RE = re.compile(r"<article[^>]*>(.*?)</article>", re.I | re.S)
 LINK_IN_ARTICLE_RE = re.compile(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', re.I | re.S)
 H2_LINK_RE = re.compile(r'<h[1-6][^>]*><a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', re.I | re.S)
+
+
+# ------------------------------
+# Full-text helpers
+# ------------------------------
+
+OG_IMG_RE = re.compile(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', re.I)
+TW_IMG_RE = re.compile(r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']', re.I)
+STRIP_TAGS_RE = re.compile(r"<[^>]+>")
+
+
+def text_len(html: str) -> int:
+    if not html:
+        return 0
+    return len(STRIP_TAGS_RE.sub("", html).strip())
+
+
+def looks_like_excerpt(html: str) -> bool:
+    if not html:
+        return True
+    tlen = text_len(html)
+    # heurísticas simples: muito curto ou padrão típico de WP
+    return tlen < 700 or "The post " in html or "appeared first on" in html
+
+
+def fetch_page(url: str):
+    req = Request(url, headers=HEADERS)
+    with urlopen(req, timeout=12) as resp:
+        html = resp.read().decode("utf-8", "ignore")
+        base_url = resp.geturl()
+    return html, base_url
+
+
+def pick_meta_image(page_html: str, base_url: str) -> Optional[str]:
+    m = OG_IMG_RE.search(page_html) or TW_IMG_RE.search(page_html)
+    return urljoin(base_url, m.group(1)) if m else None
+
+
+def extract_main_html(page_html: str) -> Optional[str]:
+    # 1) Readability (melhor qualidade)
+    if HAVE_READABILITY:
+        try:
+            return Document(page_html).summary(html_partial=True)
+        except Exception:
+            pass
+    # 2) <article> direto
+    m = ARTICLE_RE.search(page_html)
+    if m:
+        return m.group(0)
+    # 3) Fallback com BeautifulSoup
+    if HAVE_BS4:
+        try:
+            s = BeautifulSoup(page_html, "lxml")
+            main = (
+                s.find("article")
+                or s.find("main")
+                or s.find("div", class_=re.compile(r"(post|entry|content)", re.I))
+            )
+            if main:
+                return str(main)
+        except Exception:
+            pass
+    return None
+
+
+def upgrade_to_fulltext(link: Optional[str], current_html: str, current_image: Optional[str]) -> tuple[str, Optional[str]]:
+    """
+    Se o conteúdo parece resumo, baixa a página do link e extrai o artigo completo.
+    Retorna (html, image) — o HTML pode vir limpo; a imagem pode ser og:image.
+    """
+    if not FETCH_FULLTEXT or not link or not looks_like_excerpt(current_html):
+        return current_html, current_image
+    try:
+        page_html, base_url = fetch_page(link)
+        art_html = extract_main_html(page_html)
+        if art_html:
+            # se vier artigo, preferimos ele
+            new_html = art_html
+            new_img = current_image or pick_meta_image(page_html, base_url)
+            return new_html, new_img
+    except Exception:
+        pass
+    return current_html, current_image
 
 
 def extract_image(entry, content_html: str) -> Optional[str]:
@@ -389,24 +504,37 @@ def fetch_feed(url: str, force_html: bool = False):
             upsert_feed(conn, feed_url, title, site_url)
             feed_row = get_feed_by_url(conn, feed_url)
             for e in parsed.entries:
-                guid = e.get("id") or e.get("guid") or e.get("link") or (e.get("title", "") + str(e.get("published", "")))
+                guid = e.get("id") or e.get("guid") or e.get("link") or (
+                    e.get("title", "") + str(e.get("published", ""))
+                )
                 item_id = sha1(guid)
-                content_html = ""
+
+                # 1) pega o que vier do feed
                 if e.get("content") and isinstance(e.get("content"), list):
                     content_html = e["content"][0].get("value", "")
                 else:
                     content_html = e.get("summary", "")
+
+                # 2) tenta promover para "full text" se parecer apenas resumo  # NEW
+                link_url = e.get("link", "#")
+                image = extract_image(e, content_html)  # imagem inicial (feed)
+                content_html, image = upgrade_to_fulltext(
+                    link_url, content_html, image
+                )  # NEW
+
+                # 3) sanitiza o HTML final  # (pode ser do feed ou extraído)
                 content_clean = sanitize_html(content_html)
+
                 summary = (bleach.clean(e.get("summary", ""), strip=True) or "")[:500]
                 ts = to_ts(e.get("published_parsed") or e.get("updated_parsed"))
-                image = extract_image(e, content_html)
+
                 insert_item(
                     conn,
                     {
                         "id": item_id,
                         "feed_id": feed_row["id"],
                         "title": e.get("title") or "(sem título)",
-                        "link": e.get("link", "#"),
+                        "link": link_url,
                         "author": e.get("author", ""),
                         "pub_date": ts,
                         "content": content_clean,
