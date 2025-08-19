@@ -6,7 +6,7 @@ Versão em Python com FastAPI + SQLite + Feedparser + APScheduler + Tailwind (UI
 Como rodar:
   1) Salve como app.py
   2) python -m venv .venv && source .venv/bin/activate  # Windows: .venv\Scripts\activate
-  3) pip install fastapi uvicorn feedparser apscheduler bleach
+  3) pip install fastapi uvicorn feedparser apscheduler bleach requests
   4) python app.py
   5) Abra http://localhost:8000
 
@@ -27,6 +27,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import bleach
+import requests  # NEW
 
 PORT = int(os.getenv("PORT", 8000))
 REFRESH_MINUTES = int(os.getenv("REFRESH_MINUTES", 15))
@@ -127,6 +128,79 @@ def sha1(s: str) -> str:
 
 
 IMG_RE = re.compile(r"<img[^>]+src=['\"]([^'\"]+)['\"]", re.I)
+
+# ------------------------------
+# YouTube helpers
+# ------------------------------
+
+YTC_CHANNEL_RE = re.compile(r"(?:https?://)?(?:www\.)?youtube\.com/(?:channel/)(UC[0-9A-Za-z_-]+)", re.I)
+YTC_USER_RE    = re.compile(r"(?:https?://)?(?:www\.)?youtube\.com/(?:user/)([0-9A-Za-z]+)", re.I)
+YTC_HANDLE_RE  = re.compile(r"^(?:https?://)?(?:www\.)?youtube\.com/@([A-Za-z0-9_.-]+)$", re.I)
+
+def _youtube_rss_for_channel_id(channel_id: str) -> str:
+    return f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
+
+def _youtube_rss_for_user(user: str) -> str:
+    return f"https://www.youtube.com/feeds/videos.xml?user={user}"
+
+def _resolve_handle_to_channel_id(handle: str) -> Optional[str]:
+    """
+    Resolve @handle -> channel_id (UC...) fazendo um GET na página do canal e
+    procurando 'channelId' no HTML.
+    """
+    try:
+        url = f"https://www.youtube.com/@{handle}"
+        r = requests.get(url, timeout=8)
+        r.raise_for_status()
+        html = r.text
+        # padrões comuns no HTML do YouTube
+        m = re.search(r'"channelId":"(UC[0-9A-Za-z_-]+)"', html)
+        if not m:
+            m = re.search(r'href="/channel/(UC[0-9A-Za-z_-]+)"', html)
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+def normalize_source_url(url: str) -> str:
+    """
+    Aceita entradas como:
+      - https://www.youtube.com/channel/UCxxxx
+      - https://www.youtube.com/user/AlgumUsuario
+      - https://www.youtube.com/@handle  ou  @handle
+    e retorna a URL RSS correta do YouTube.
+    Caso não seja YouTube, retorna a URL original.
+    """
+    if not url:
+        return url
+
+    u = url.strip()
+
+    # Se veio apenas "@handle", trate como URL de handle
+    if u.startswith("@"):
+        u = f"https://www.youtube.com/{u}"
+
+    # channel/UC...
+    m = YTC_CHANNEL_RE.match(u)
+    if m:
+        return _youtube_rss_for_channel_id(m.group(1))
+
+    # user/Username
+    m = YTC_USER_RE.match(u)
+    if m:
+        return _youtube_rss_for_user(m.group(1))
+
+    # /@handle
+    m = YTC_HANDLE_RE.match(u)
+    if m:
+        ch = _resolve_handle_to_channel_id(m.group(1))
+        if ch:
+            return _youtube_rss_for_channel_id(ch)
+        # fallback: mantém original se não conseguiu resolver
+        return u
+
+    # não é YouTube reconhecido → retorna como veio
+    return u
+
 
 
 def extract_image(entry, content_html: str) -> Optional[str]:
@@ -303,6 +377,7 @@ async def api_add_feed(payload: dict):
     if not url:
         return JSONResponse({"error": "Informe url"}, status_code=400)
     try:
+        url = normalize_source_url(url)  # NEW: normaliza antes de buscar
         fetch_feed(url)
         return JSONResponse({"ok": True})
     except Exception as e:
