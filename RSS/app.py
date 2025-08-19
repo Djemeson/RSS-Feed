@@ -10,6 +10,8 @@ Como rodar:
   4) python app.py
   5) Abra http://localhost:8000
 
+Suporta também canais do YouTube — basta informar a URL do canal ao adicionar um feed.
+
 Variáveis de ambiente opcionais:
   REFRESH_MINUTES=15
   SEED_FEEDS="https://www.theverge.com/rss/index.xml\nhttps://hnrss.org/frontpage"
@@ -128,6 +130,31 @@ def sha1(s: str) -> str:
 
 IMG_RE = re.compile(r"<img[^>]+src=['\"]([^'\"]+)['\"]", re.I)
 
+YOUTUBE_CHANNEL_RE = re.compile(
+    r"https?://(?:www\.)?youtube\.com/channel/([A-Za-z0-9_-]+)", re.I
+)
+YOUTUBE_USER_RE = re.compile(
+    r"https?://(?:www\.)?youtube\.com/user/([A-Za-z0-9_-]+)", re.I
+)
+YOUTUBE_HANDLE_RE = re.compile(
+    r"https?://(?:www\.)?youtube\.com/@([A-Za-z0-9_-]+)", re.I
+)
+
+
+def normalize_feed_url(url: str) -> str:
+    if not url:
+        return url
+    m = YOUTUBE_CHANNEL_RE.match(url)
+    if m:
+        return f"https://www.youtube.com/feeds/videos.xml?channel_id={m.group(1)}"
+    m = YOUTUBE_USER_RE.match(url)
+    if m:
+        return f"https://www.youtube.com/feeds/videos.xml?user={m.group(1)}"
+    m = YOUTUBE_HANDLE_RE.match(url)
+    if m:
+        return f"https://www.youtube.com/feeds/videos.xml?user={m.group(1)}"
+    return url
+
 
 def extract_image(entry, content_html: str) -> Optional[str]:
     # media:content
@@ -199,6 +226,7 @@ def insert_item(conn, data: dict):
 
 
 def fetch_feed(url: str):
+    url = normalize_feed_url(url)
     conn = get_db()
     try:
         parsed = feedparser.parse(url)
@@ -609,7 +637,7 @@ HTML = """<!doctype html>
     }
 
     document.getElementById('addFeedBtn').onclick=async()=>{
-      const url=prompt('Informe a URL do feed RSS:'); if(!url) return;
+      const url=prompt('Informe a URL do feed RSS ou canal do YouTube:'); if(!url) return;
       const resp=await fetch('/api/feeds',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
       if(resp.ok){ await loadFeeds(); await loadItems(true); } else { alert('Erro ao adicionar feed'); }
     };
