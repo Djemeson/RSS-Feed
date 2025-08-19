@@ -43,6 +43,13 @@ https://hnrss.org/frontpage
 
 DB_PATH = "rss.db"
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+}
+feedparser.USER_AGENT = HEADERS["User-Agent"]
+
 app = FastAPI(title="RSS Reader")
 app.add_middleware(
     CORSMiddleware,
@@ -224,13 +231,13 @@ def insert_item(conn, data: dict):
 
 
 def parse_feed_url(feed_url: str):
-    parsed = feedparser.parse(feed_url)
+    parsed = feedparser.parse(feed_url, agent=HEADERS["User-Agent"], request_headers=HEADERS)
     if parsed.feed and parsed.entries:
         ftype = "atom" if "atom" in (parsed.version or "").lower() else "rss"
         title = parsed.feed.get("title", feed_url)
         return {"url": feed_url, "title": title, "type": ftype, "parsed": parsed}
     try:
-        req = Request(feed_url, headers={"User-Agent": "Mozilla/5.0"})
+        req = Request(feed_url, headers=HEADERS)
         with urlopen(req, timeout=10) as resp:
             data = resp.read()
         js = json.loads(data)
@@ -244,7 +251,7 @@ def parse_feed_url(feed_url: str):
 
 def scrape_html_page(url: str):
     try:
-        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        req = Request(url, headers=HEADERS)
         with urlopen(req, timeout=10) as resp:
             html = resp.read().decode("utf-8", "ignore")
             base_url = resp.geturl()
@@ -279,11 +286,16 @@ def discover_feeds(url: str):
     if candidate:
         return [candidate]
     try:
-        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        req = Request(url, headers=HEADERS)
         with urlopen(req, timeout=10) as resp:
             html = resp.read().decode("utf-8", "ignore")
             base_url = resp.geturl()
     except Exception:
+        for suffix in ("feed", "feed/", "rss", "rss.xml", "atom.xml", "index.xml"):
+            test = urljoin(url if url.endswith("/") else url + "/", suffix)
+            parsed = parse_feed_url(test)
+            if parsed:
+                return [parsed]
         raise ValueError("Feed não encontrado")
     feeds = []
     for tag in FEED_LINK_RE.findall(html):
@@ -292,6 +304,13 @@ def discover_feeds(url: str):
             continue
         feed_url = urljoin(base_url, href_match.group(1))
         parsed = parse_feed_url(feed_url)
+        if parsed:
+            feeds.append(parsed)
+    if feeds:
+        return feeds
+    for suffix in ("feed", "feed/", "rss", "rss.xml", "atom.xml", "index.xml"):
+        test = urljoin(base_url, suffix)
+        parsed = parse_feed_url(test)
         if parsed:
             feeds.append(parsed)
     if feeds:
